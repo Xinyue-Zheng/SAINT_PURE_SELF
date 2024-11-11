@@ -10,6 +10,7 @@ from torchvision import models
 import torch.nn.functional as F
 import numpy as np
 from augmentations import embed_data_mask
+from models.model import *
 
 
 def cal_correct(model_with_head,model,opt, data, device):
@@ -170,6 +171,26 @@ class ReconstructionHead(nn.Module):
                 num_out = None
             return {"num_out": num_out, "cat_out": cat_out}
 
+
+class preprocess_net():
+    def __init__(self, categories, num_continuous, d_token):
+        self.num_categories = len(categories)
+        self.num_continuous = num_continuous
+        self.dim = d_token
+        cat_mask_offset = F.pad(torch.Tensor(self.num_categories).fill_(2).type(torch.int8), (1, 0), value = 0) 
+        cat_mask_offset = cat_mask_offset.cumsum(dim = -1)[:-1]
+
+        con_mask_offset = F.pad(torch.Tensor(self.num_continuous).fill_(2).type(torch.int8), (1, 0), value = 0) 
+        con_mask_offset = con_mask_offset.cumsum(dim = -1)[:-1]
+
+        self.register_buffer('cat_mask_offset', cat_mask_offset)
+        self.register_buffer('con_mask_offset', con_mask_offset)
+
+        self.mask_embeds_cat = nn.Embedding(self.num_categories*2, self.dim)
+        self.mask_embeds_cont = nn.Embedding(self.num_continuous*2, self.dim)
+    def forward():
+        pass
+
 # Step 4: Create a Composite Model
 class SAINT_Reconstruction(nn.Module):
     def __init__(self, base_model, new_head):
@@ -181,4 +202,45 @@ class SAINT_Reconstruction(nn.Module):
         x_base = self.base_model.transformer(x_categ_enc, x_cont_enc)
         x = self.new_head(x_base)
         return x
+    
+class FT_Reconstruction(nn.Module):
+    def __init__(self, categories, num_continuous, d_token, num_special_tokens, base_model, new_head, mlp_act=None, dim_out = 1, mlp_hidden_mults = (4, 2), cont_embedding = "MLP"):
+        super(FT_Reconstruction, self).__init__()
+        self.cont_embeddings = cont_embedding
+        self.num_categories = len(categories)
+        self.num_continuous = num_continuous
+        self.num_unique_categories = sum(categories)
+        self.total_tokens = self.num_unique_categories + num_special_tokens
+        self.dim = d_token
+        
+        categories_offset = F.pad(torch.tensor(list(categories)), (1, 0), value = num_special_tokens)
+        categories_offset = categories_offset.cumsum(dim = -1)[:-1]
+        self.register_buffer('categories_offset', categories_offset)
+        
+        cat_mask_offset = F.pad(torch.Tensor(self.num_categories).fill_(2).type(torch.int8), (1, 0), value = 0) 
+        cat_mask_offset = cat_mask_offset.cumsum(dim = -1)[:-1]
 
+        con_mask_offset = F.pad(torch.Tensor(self.num_continuous).fill_(2).type(torch.int8), (1, 0), value = 0) 
+        con_mask_offset = con_mask_offset.cumsum(dim = -1)[:-1]
+
+        self.register_buffer('cat_mask_offset', cat_mask_offset)
+        self.register_buffer('con_mask_offset', con_mask_offset)
+
+        
+        # input_size = (d_token * self.num_categories)  + (d_token * num_continuous)
+        # l = input_size // 8
+        # hidden_dimensions = list(map(lambda t: l * t, mlp_hidden_mults))
+        # all_dimensions = [input_size, *hidden_dimensions, dim_out]
+        self.simple_MLP = nn.ModuleList([simple_MLP([1,100,self.dim]) for _ in range(self.num_continuous)])
+        # self.mlp = MLP(all_dimensions, act = mlp_act)
+        self.embeds = nn.Embedding(self.total_tokens, self.dim)
+        
+        self.mask_embeds_cat = nn.Embedding(self.num_categories*2, self.dim)
+        self.mask_embeds_cont = nn.Embedding(self.num_continuous*2, self.dim)
+        self.base_model = base_model
+        self.new_head = new_head
+
+    def forward(self, x_categ_enc):
+        x_base = self.base_model(x_categ_enc)
+        x = self.new_head(x_base)
+        return x

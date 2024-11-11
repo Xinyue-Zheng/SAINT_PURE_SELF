@@ -113,6 +113,111 @@ def data_prep_openml(ds_id, seed, task, datasplit=[.65, .15, .2]):
     # import ipdb; ipdb.set_trace()
     return cat_dims, cat_idxs, con_idxs, X_train, y_train, X_valid, y_valid, X_test, y_test, train_mean, train_std
 
+def data_prep_keyvalue(data_dict, categorical_columns, cont_columns, datasplit=[.65, .15, .2]):
+    # Step 1: Embed the keys as categorical features
+    all_keys = list(data_dict[0].keys())  # Assuming all dictionaries have the same keys
+    key_encoder = LabelEncoder()
+    key_encoder.fit(all_keys)
+    key_dims = len(key_encoder.classes_)
+    
+    # Assign an index to each key based on the embedding
+    for entry in data_dict:
+        entry["key_emb"] = [key_encoder.transform([k])[0] for k in entry.keys()]
+
+    # Add a "Set" key to each dictionary entry to split data into train, valid, and test sets
+    for entry in data_dict:
+        entry["Set"] = np.random.choice(["train", "valid", "test"], p=datasplit)
+    
+    train_data = [entry for entry in data_dict if entry["Set"] == "train"]
+    valid_data = [entry for entry in data_dict if entry["Set"] == "valid"]
+    test_data = [entry for entry in data_dict if entry["Set"] == "test"]
+    # Remove the "Set" key after assigning splits
+    # for entry in data_dict:
+    #     entry.pop("Set", None)
+    
+    # Initialize missing value mask
+    nan_mask = []
+
+    # Handle categorical columns: Track missing values, then apply Label Encoding
+    cat_dims = []
+    for col in categorical_columns:
+        # Track missing values before encoding
+        col_nan_mask = [(0 if entry[col] is None else 1) for entry in data_dict]
+        nan_mask.append(col_nan_mask)
+        
+        # Replace None with "MissingValue" and apply Label Encoding
+        unique_values = set(entry[col] for entry in data_dict if entry[col] is not None)
+        l_enc = LabelEncoder()
+        l_enc.fit(list(unique_values) + ["MissingValue"])  # Include "MissingValue" for NaNs
+        cat_dims.append(len(l_enc.classes_))
+        
+        for entry in data_dict:
+            if entry[col] != entry[col]:
+                entry[col] = "MissingValue"
+            entry[col] = l_enc.transform([entry[col]])[0]
+
+    # Handle continuous columns: Fill missing values with the mean of the train split and add mask
+    for col in cont_columns:
+        # Calculate mean from train data
+        train_values = [entry[col] for entry in train_data if entry[col] is not None]
+        train_mean = np.mean(train_values) if train_values else 0
+        
+        # Create nan mask and fill missing values
+        col_nan_mask = [(1 if entry[col] is not None else 0) for entry in data_dict]
+        nan_mask.append(col_nan_mask)
+        
+        for entry in data_dict:
+            if entry[col] is None:
+                entry[col] = train_mean  # Fill missing values for continuous columns
+
+    # Prepare final nan_mask array by transposing rows and columns
+    nan_mask = np.array(nan_mask).T  # shape: [num_entries, num_columns]
+
+    # Split data and prepare for output
+    def data_split_dict(data, cont_columns, cat_dims, key_dims, nan_mask):
+        data_list = []
+        key_embeds = []
+        
+        for entry in data:
+            row_data = []
+            row_key_emb = entry["key_emb"]
+            
+            # Process each column's value
+            for col in categorical_columns + cont_columns:
+                row_data.append(entry[col])
+                
+            data_list.append(row_data)
+            key_embeds.append(row_key_emb)
+        
+        return {
+            "data": np.array(data_list),
+            "nan_mask": nan_mask,
+            "key_embeds": np.array(key_embeds)
+        }
+
+    # Splitting the nan_mask by data split
+    nan_mask_train = nan_mask[[i for i, entry in enumerate(data_dict) if entry["Set"] == "train"]]
+    nan_mask_valid = nan_mask[[i for i, entry in enumerate(data_dict) if entry["Set"] == "valid"]]
+    nan_mask_test = nan_mask[[i for i, entry in enumerate(data_dict) if entry["Set"] == "test"]]
+    for entry in data_dict:
+         entry.pop("Set", None)
+    X_train = data_split_dict(train_data, cont_columns, cat_dims, key_dims, nan_mask_train)
+    X_valid = data_split_dict(valid_data, cont_columns, cat_dims, key_dims, nan_mask_valid)
+    X_test = data_split_dict(test_data, cont_columns, cat_dims, key_dims, nan_mask_test)
+    
+    # Calculate train mean and standard deviation for continuous columns
+    train_cont_data = np.array([entry[col] for entry in train_data for col in cont_columns], dtype=np.float32)
+    train_mean, train_std = train_cont_data.mean(axis=0), train_cont_data.std(axis=0)
+    train_std = np.where(train_std < 1e-6, 1e-6, train_std)
+    
+    cat_idxs = list(range(len(categorical_columns)))
+    con_idxs = list(range(len(categorical_columns), len(categorical_columns) + len(cont_columns)))
+    
+    return cat_dims, cat_idxs, con_idxs, key_dims, X_train, X_valid, X_test, train_mean, train_std
+
+
+
+
 def data_prep_df(X, categorical_columns, cont_columns, datasplit=[.65, .15, .2]):
     for col in categorical_columns:
         X[col] = X[col].astype("object")
@@ -148,6 +253,36 @@ def data_prep_df(X, categorical_columns, cont_columns, datasplit=[.65, .15, .2])
     train_std = np.where(train_std < 1e-6, 1e-6, train_std)
     
     return cat_dims, cat_idxs, con_idxs, X_train, X_valid, X_test, train_mean, train_std
+
+
+class DataSetCatCon_dict(Dataset):
+    def __init__(self, X, cat_cols,continuous_mean_std=None):
+        
+        cat_cols = list(cat_cols)
+        self.key = X['key_embeds'].copy().astype(np.int64)
+        X_mask =  X['nan_mask'].copy()
+        X = X['data'].copy()
+        
+        con_cols = list(set(np.arange(X.shape[1])) - set(cat_cols))
+        self.X1 = X[:,cat_cols].copy().astype(np.int64) #categorical columns
+        self.X2 = X[:,con_cols].copy().astype(np.float32) #numerical columns
+        self.X1_mask = X_mask[:,cat_cols].copy().astype(np.int64) #categorical columns
+        self.X2_mask = X_mask[:,con_cols].copy().astype(np.int64) #numerical columns
+        # self.X_key = key[:,:].copy().astype(np.int64)
+        # self.cls = np.zeros_like(self.y,dtype=int)
+        # self.cls_mask = np.ones_like(self.y,dtype=int)
+        if continuous_mean_std is not None:
+            mean, std = continuous_mean_std
+            self.X2 = (self.X2 - mean) / std
+
+    def __len__(self):
+        length=self.X2.shape[0]
+        return length
+    
+    def __getitem__(self, idx):
+        # X1 has categorical data, X2 has continuous
+        return self.X1[idx], self.X2[idx], self.X1_mask[idx], self.X2_mask[idx], self.key[idx]
+
 
 class DataSetCatCon_without_target(Dataset):
     def __init__(self, X, cat_cols,continuous_mean_std=None):
